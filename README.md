@@ -16,8 +16,8 @@ Its a simple to make, standalone GPS receiver, showing everything you need to kn
 
 ## Required Components
 
-+ Nice!Nano: [AliExpress Link](https://s.click.aliexpress.com/e/_oDiDpnE)
-+ M10S GPS: [AliExpress Link](https://s.click.aliexpress.com/e/_omVV4ia)
++ Nice!Nano: [AliExpress Link](https://s.click.aliexpress.com/e/_omlmCuu)
++ M10S GPS: [AliExpress Link](https://s.click.aliexpress.com/e/_oChRvVH)
 + 0.96Inch Display: [AliExpress Link](https://s.click.aliexpress.com/e/_ooXwYgq)
 + 6*6 Silicone Switch: [AliExpress Link](https://s.click.aliexpress.com/e/_oDcs8Wa)
 
