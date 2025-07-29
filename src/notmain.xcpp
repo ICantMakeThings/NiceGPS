@@ -4,20 +4,53 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
+#include "Adafruit_TinyUSB.h"
+#include "tusb.h"
+using namespace Adafruit_LittleFS_Namespace;
 
 static const int RXPin = PIN_008, TXPin = PIN_006;
 static const uint32_t GPSBaud = 38400;
 
+bool usbMounted = false;
+
+bool checkActive = false;
+
+#define SECTOR_SIZE 512
+#define RAM_DISK_SECTORS (RAM_DISK_SIZE / SECTOR_SIZE)
+
+#define FAT_START_SECTOR 1
+#define FAT_SECTORS 1
+#define ROOT_DIR_START_SECTOR (FAT_START_SECTOR + FAT_SECTORS)
+#define ROOT_DIR_ENTRIES 16
+#define ROOT_DIR_SECTORS ((ROOT_DIR_ENTRIES * 32 + SECTOR_SIZE - 1) / SECTOR_SIZE)
+#define DATA_START_SECTOR (ROOT_DIR_START_SECTOR + ROOT_DIR_SECTORS)
+#define CLUSTER_SIZE 1
+
+const char TRACK_FILENAME[11] = {'T', 'R', 'A', 'C', 'K', ' ', ' ', ' ', 'G', 'P', 'X'};
+
+uint32_t gpxFileSize = 0;
+
+#define MBR_SECTOR 0
+#define FAT_SECTOR FAT_START_SECTOR
+#define ROOT_DIR_SECTOR ROOT_DIR_START_SECTOR
+#define DATA_SECTOR DATA_START_SECTOR
+
 #define BUTTON_UP_PIN PIN_031
 #define BUTTON_DOWN_PIN PIN_029
 unsigned long lastActivityTime = 0;
+unsigned long lastPinInputTime = 0;
+unsigned long lastGPXLog = 0;
 unsigned long buttonHoldStart = 0;
 bool isHolding = false;
 
 const unsigned long INACTIVITY_TIMEOUT = 60000;
+const unsigned long GPX_LOG_INTERVAL = 300000;
 const unsigned long SLEEP_HOLD_DURATION = 5000;
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
+int inputIndex = 0;
 int currentPage = 0;
 const unsigned long debounceDelay = 200;
 unsigned long lastDebounce = 0;
@@ -29,6 +62,158 @@ double maxSpeed = 0.0;
 double totalDistance = 0.0;
 double lastLat = 0.0, lastLon = 0.0;
 bool firstFix = true;
+bool usbConnected = false;
+
+#define RAM_DISK_SIZE 16 * 1024
+static uint8_t ram_disk[RAM_DISK_SIZE];
+Adafruit_USBD_MSC usb_msc;
+
+void initRAMDisk()
+{
+  memset(ram_disk, 0, RAM_DISK_SIZE);
+
+  uint8_t *mbr = ram_disk + (MBR_SECTOR * SECTOR_SIZE);
+
+  mbr[0] = 0xEB;
+  mbr[1] = 0x3C;
+  mbr[2] = 0x90;
+
+  memcpy(mbr + 3, "MSDOS5.0", 8);
+
+  mbr[11] = 0x00;
+  mbr[12] = 0x02;
+
+  mbr[13] = CLUSTER_SIZE;
+
+  mbr[14] = 0x01;
+  mbr[15] = 0x00;
+
+  mbr[16] = 0x01;
+
+  mbr[17] = ROOT_DIR_ENTRIES & 0xFF;
+  mbr[18] = (ROOT_DIR_ENTRIES >> 8) & 0xFF;
+
+  mbr[19] = RAM_DISK_SECTORS & 0xFF;
+  mbr[20] = (RAM_DISK_SECTORS >> 8) & 0xFF;
+
+  mbr[21] = 0xF8;
+
+  mbr[22] = FAT_SECTORS;
+  mbr[23] = 0x00;
+
+  mbr[24] = 0x20;
+  mbr[25] = 0x00;
+  mbr[26] = 0x40;
+  mbr[27] = 0x00;
+
+  mbr[28] = 0x00;
+  mbr[29] = 0x00;
+  mbr[30] = 0x00;
+  mbr[31] = 0x00;
+
+  mbr[36] = 0x80;
+  mbr[38] = 0x29;
+
+  mbr[39] = 0x12;
+  mbr[40] = 0x34;
+  mbr[41] = 0x56;
+  mbr[42] = 0x78;
+
+  memcpy(mbr + 43, "NiceGPS  ", 11);
+
+  memcpy(mbr + 54, "FAT12   ", 8);
+
+  mbr[510] = 0x55;
+  mbr[511] = 0xAA;
+
+  uint8_t *fat = ram_disk + (FAT_SECTOR * SECTOR_SIZE);
+
+  fat[0] = 0xF8;
+  fat[1] = 0xFF;
+  fat[2] = 0xFF;
+
+  fat[3] = 0xFF;
+  fat[4] = 0x0F;
+
+  uint8_t *root = ram_disk + (ROOT_DIR_SECTOR * SECTOR_SIZE);
+  memset(root, 0, ROOT_DIR_SECTORS * SECTOR_SIZE);
+
+  memcpy(root, TRACK_FILENAME, 11);
+  root[11] = 0x20;
+
+  root[26] = 0x02;
+  root[27] = 0x00;
+
+  root[28] = 0x00;
+  root[29] = 0x00;
+  root[30] = 0x00;
+  root[31] = 0x00;
+}
+
+void updateRAMDiskWithGPX()
+{
+  File gpx = InternalFS.open("/track.gpx", FILE_O_READ);
+  if (!gpx)
+  {
+    Serial.println("GPX file not found");
+    gpxFileSize = 0;
+
+    memset(ram_disk + (DATA_SECTOR * SECTOR_SIZE), 0, RAM_DISK_SIZE - (DATA_SECTOR * SECTOR_SIZE));
+    return;
+  }
+
+  gpxFileSize = gpx.size();
+
+  uint32_t maxFileSize = (RAM_DISK_SIZE - (DATA_SECTOR * SECTOR_SIZE));
+  if (gpxFileSize > maxFileSize)
+    gpxFileSize = maxFileSize;
+
+  gpx.read(ram_disk + (DATA_SECTOR * SECTOR_SIZE), gpxFileSize);
+  gpx.close();
+
+  uint8_t *root = ram_disk + (ROOT_DIR_SECTOR * SECTOR_SIZE);
+  root[28] = (uint8_t)(gpxFileSize & 0xFF);
+  root[29] = (uint8_t)((gpxFileSize >> 8) & 0xFF);
+  root[30] = (uint8_t)((gpxFileSize >> 16) & 0xFF);
+  root[31] = (uint8_t)((gpxFileSize >> 24) & 0xFF);
+}
+
+void checkUSBMount()
+{
+  bool mountedNow = tud_ready();
+
+  if (mountedNow && !usbMounted)
+  {
+    updateRAMDiskWithGPX();
+  }
+  usbMounted = mountedNow;
+}
+
+void setupUSBMSC()
+{
+  usb_msc.setID("ICMT.CC", "NiceGPS", "0.01");
+
+  usb_msc.setReadWriteCallback(
+      [](uint32_t lba, void *buffer, uint32_t bufsize) -> int32_t
+      {
+        if ((lba + bufsize / 512) > RAM_DISK_SECTORS)
+        {
+          return -1;
+        }
+        memcpy(buffer, ram_disk + lba * 512, bufsize);
+        return bufsize;
+      },
+      [](uint32_t lba, uint8_t *buffer, uint32_t bufsize) -> int32_t
+      {
+        return bufsize;
+      },
+      []() {});
+
+  usb_msc.setCapacity(RAM_DISK_SECTORS, SECTOR_SIZE);
+  usb_msc.setUnitReady(true);
+
+  usb_msc.begin();
+}
 
 float readBatteryVoltage()
 {
@@ -87,11 +272,53 @@ void drawBatteryIcon(float voltage)
   }
 }
 
+void initGPXFile()
+{
+  if (!InternalFS.exists("/track.gpx"))
+  {
+    File g = InternalFS.open("/track.gpx", FILE_O_WRITE);
+    if (g)
+    {
+      g.println("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+      g.println("<gpx version=\"1.1\" creator=\"icmt.cc GPS\">");
+      g.println("<trk><name>Track</name><trkseg>");
+      g.close();
+    }
+  }
+}
+
+void logGPXPoint()
+{
+  if (!gps.location.isValid() || !gps.time.isValid())
+    return;
+  File f = InternalFS.open("/track.gpx", FILE_O_WRITE);
+  if (f)
+  {
+    f.seek(f.size());
+    f.print("<trkpt lat=\"");
+    f.print(gps.location.lat(), 6);
+    f.print("\" lon=\"");
+    f.print(gps.location.lng(), 6);
+    f.println("\">");
+    f.print("  <ele>");
+    f.print(gps.altitude.meters(), 1);
+    f.println("</ele>");
+    f.print("  <time>");
+    char tb[25];
+    sprintf(tb, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+            gps.date.year(), gps.date.month(), gps.date.day(),
+            gps.time.hour(), gps.time.minute(), gps.time.second());
+    f.print(tb);
+    f.println("</time></trkpt>");
+    f.close();
+  }
+}
+
 void enterUltraSleep()
 {
   display.clearDisplay();
   display.setCursor(0, 0);
-  display.println("ZzZz");
+  display.println("Sleep Mode");
   display.display();
   delay(1000);
   display.ssd1306_command(SSD1306_DISPLAYOFF);
@@ -99,6 +326,17 @@ void enterUltraSleep()
   NRF_POWER->SYSTEMOFF = 1;
   while (true)
   {
+  }
+}
+
+void closeGPXFile()
+{
+  File f = InternalFS.open("/track.gpx", FILE_O_WRITE);
+  if (f)
+  {
+    f.seek(f.size());
+    f.println("</trkseg></trk></gpx>");
+    f.close();
   }
 }
 
@@ -129,6 +367,7 @@ void checkButtons()
   }
   if (isHolding && millis() - buttonHoldStart >= SLEEP_HOLD_DURATION)
   {
+    closeGPXFile();
     enterUltraSleep();
   }
 
@@ -138,9 +377,9 @@ void checkButtons()
     if (millis() - lastDebounce > debounceDelay)
     {
       if (up == LOW)
-        currentPage = (currentPage + 1) % 5;
+        currentPage = (currentPage + 1) % 6;
       if (down == LOW)
-        currentPage = (currentPage + 4) % 5;
+        currentPage = (currentPage + 5) % 6;
       lastDebounce = millis();
     }
   }
@@ -177,15 +416,32 @@ void updateStats()
 void drawSpeedLargePage()
 {
   display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 20);
+  display.print("Speed: ");
+  display.print(gps.speed.kmph(), 1);
+  display.print("km/h");
+  drawBatteryIcon(readBatteryVoltage());
+  display.display();
+}
+
+void drawUSBPage()
+{
+  display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.drawLine(0, 10, 128, 10, WHITE);
-  display.println("Speed | km/h");
-
-  display.setTextSize(3);
-  display.setCursor(10, 25);
-  display.print(gps.speed.kmph(), 1);
-
+  display.println("USB Mode");
+  if (TinyUSBDevice.mounted())
+  {
+    display.setCursor(0, 16);
+    display.println("Drive Active:");
+    display.println("/track.gpx");
+  }
+  else
+  {
+    display.setCursor(0, 16);
+    display.println("No USB Host");
+  }
   drawBatteryIcon(readBatteryVoltage());
   display.display();
 }
@@ -196,9 +452,8 @@ void drawMainPage()
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println("Main GPS Info");
-  display.drawLine(0, 10, 128, 10, WHITE);
 
-  display.setCursor(0, 14);
+  display.setCursor(0, 12);
   display.print("Fix: ");
   display.println(gps.location.isValid() ? "Yes" : "No");
 
@@ -211,7 +466,9 @@ void drawMainPage()
   display.print("Lng: ");
   display.println(gps.location.lng(), 6);
 
-  drawBatteryIcon(readBatteryVoltage());
+  float batteryVoltage = readBatteryVoltage();
+  drawBatteryIcon(batteryVoltage);
+
   display.display();
 }
 
@@ -221,9 +478,8 @@ void drawAdvancedPage()
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println("Advanced GPS Data");
-  display.drawLine(0, 10, 128, 10, WHITE);
 
-  display.setCursor(0, 14);
+  display.setCursor(0, 12);
   display.print("Alt: ");
   display.println(gps.altitude.meters(), 1);
 
@@ -236,7 +492,9 @@ void drawAdvancedPage()
   display.print("Fix Age: ");
   display.println(gps.location.age());
 
-  drawBatteryIcon(readBatteryVoltage());
+  float batteryVoltage = readBatteryVoltage();
+  drawBatteryIcon(batteryVoltage);
+
   display.display();
 }
 
@@ -246,9 +504,8 @@ void drawSpeedPage()
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println("Speed & Distance");
-  display.drawLine(0, 10, 128, 10, WHITE);
 
-  display.setCursor(0, 14);
+  display.setCursor(0, 12);
   display.print("Speed: ");
   display.println(gps.speed.kmph(), 2);
 
@@ -258,7 +515,9 @@ void drawSpeedPage()
   display.print("Dist (km): ");
   display.println(totalDistance, 2);
 
-  drawBatteryIcon(readBatteryVoltage());
+  float batteryVoltage = readBatteryVoltage();
+  drawBatteryIcon(batteryVoltage);
+
   display.display();
 }
 
@@ -268,25 +527,20 @@ void drawTimePage()
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println("UTC Time / Date");
-  display.drawLine(0, 10, 128, 10, WHITE);
 
+  display.setCursor(0, 16);
   if (gps.time.isValid())
   {
-    display.setTextSize(2);
-    display.setCursor(10, 14);
     char buf[16];
     sprintf(buf, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
     display.println(buf);
   }
   else
   {
-    display.setTextSize(2);
-    display.setCursor(10, 14);
-    display.println("No Time");
+    display.println("Time: No Fix");
   }
 
-  display.setTextSize(1);
-  display.setCursor(0, 44);
+  display.setCursor(0, 32);
   if (gps.date.isValid())
   {
     char dateBuf[16];
@@ -298,7 +552,9 @@ void drawTimePage()
     display.println("Date: No Fix");
   }
 
-  drawBatteryIcon(readBatteryVoltage());
+  float batteryVoltage = readBatteryVoltage();
+  drawBatteryIcon(batteryVoltage);
+
   display.display();
 }
 
@@ -325,14 +581,26 @@ void setup()
   display.println("NiceGPS\nStarting...");
   display.display();
 
+  InternalFS.begin();
+  initGPXFile();
+  initRAMDisk();
+
+
   configureWakeupButtons();
   ss.begin(GPSBaud);
 
+  TinyUSBDevice.begin();
+  setupUSBMSC();
+
+
   lastActivityTime = millis();
+  lastGPXLog = millis();
 }
 
 void loop()
 {
+  checkUSBMount();
+
   smartDelay(100);
   checkButtons();
   updateStats();
@@ -352,8 +620,17 @@ void loop()
     drawTimePage();
     break;
   case 4:
+    drawUSBPage();
+    break;
+  case 5:
     drawSpeedLargePage();
     break;
+  }
+
+  if (millis() - lastGPXLog > GPX_LOG_INTERVAL)
+  {
+    logGPXPoint();
+    lastGPXLog = millis();
   }
 
   if (millis() - lastActivityTime > INACTIVITY_TIMEOUT)
@@ -365,4 +642,17 @@ void loop()
   {
     display.ssd1306_command(SSD1306_DISPLAYON);
   }
+
+  if (currentPage == 4 && !checkActive)
+  {
+    usb_msc.setUnitReady(true);
+    checkActive = true;
+  } else if (currentPage != 4 && checkActive)
+  {
+    usb_msc.setUnitReady(false);
+    checkActive = false;
+    
+  }
+
+  
 }
