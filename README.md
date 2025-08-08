@@ -33,9 +33,9 @@ I go out in big forests, I'd like to have a GPS that's decently cheap to make, f
 Its quite simple, 
 2 Buttons connected from:
 
-P0.29 to gnd.
+P0.29 to gnd. (button)
 
-P0.31 to gnd.
+P0.31 to gnd. (button)
 
 I2C for the display
 P1.06 (SCL), P1.04 (SDA)
